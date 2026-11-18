@@ -14,14 +14,15 @@ concurrency:
 
 jobs:
   publish:
-    name: Publish student's images to Docker Hub
+    name: Publish and Deploy Docker Images
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: Checkout student's repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1. Validate GitHub secrets
       - name: Validate required secrets
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -29,11 +30,13 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
-          test -n "$DOCKERHUB_USERNAME" || (echo "Missing DOCKERHUB_USERNAME" && exit 1)
-          test -n "$DOCKERHUB_TOKEN" || (echo "Missing DOCKERHUB_TOKEN" && exit 1)
-          test -n "$POSTGRES_PASSWORD" || (echo "Missing POSTGRES_PASSWORD" && exit 1)
-          test -n "$JWT_SECRET" || (echo "Missing JWT_SECRET" && exit 1)
+          test -n "$DOCKERHUB_USERNAME" || exit 1
+          test -n "$DOCKERHUB_TOKEN" || exit 1
+          test -n "$POSTGRES_PASSWORD" || exit 1
+          test -n "$JWT_SECRET" || exit 1
+          echo "All required secrets are configured."
 
+      # 2. Configure Docker
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -43,6 +46,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # 3. Build and publish backend
       - name: Build and push backend
         uses: docker/build-push-action@v6
         with:
@@ -53,6 +57,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ github.sha }}
 
+      # 4. Build and publish frontend
       - name: Build and push frontend
         uses: docker/build-push-action@v6
         with:
@@ -63,11 +68,13 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ github.sha }}
 
+      # 5. Create environment file for deployment
       - name: Create deployment environment file
         env:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
+          umask 077
           cat > .env <<EOF
           POSTGRES_DB=taskflow
           POSTGRES_USER=taskflow_user
@@ -78,39 +85,144 @@ jobs:
           PORT=3000
           EOF
 
-      - name: Validate image-based deployment Compose
+      # 6. Validate deployment compose
+      - name: Validate deployment Compose
         run: |
-          grep -q 'image:' docker-compose.deploy.yml
           if grep -Eq '^[[:space:]]+build:' docker-compose.deploy.yml; then
-            echo "Deployment Compose must use published images, not build:"
+            echo "ERROR: Deployment Compose must use published images."
             exit 1
           fi
-          docker compose -f docker-compose.deploy.yml config --quiet
 
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml config --quiet
+
+          echo "Deployment Compose configuration is valid."
+
+      # 7. Pull images
       - name: Pull published images
-        run: docker compose -f docker-compose.deploy.yml pull
-
-      - name: Deploy using Docker Hub images
-        run: docker compose -f docker-compose.deploy.yml up -d
-
-      - name: Verify deployment
         run: |
-          for attempt in $(seq 1 40); do
-            if curl --fail --silent http://localhost:3000/health; then
-              echo
-              echo "Deployment backend is healthy"
-              break
-            fi
-            if [ "$attempt" -eq 40 ]; then
-              docker compose -f docker-compose.deploy.yml ps
-              docker compose -f docker-compose.deploy.yml logs --no-color
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml pull
+
+      # 8. Start database and Redis first
+      - name: Start PostgreSQL and Redis
+        run: |
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml up -d postgres redis
+
+      # 9. Wait for database and Redis health
+      - name: Wait for infrastructure
+        run: |
+          wait_for_health() {
+            SERVICE="$1"
+            CONTAINER=$(docker compose --env-file .env \
+              -f docker-compose.deploy.yml ps -q "$SERVICE")
+
+            if [ -z "$CONTAINER" ]; then
+              echo "Container for $SERVICE was not created."
               exit 1
             fi
-            sleep 3
-          done
-          curl --fail --silent http://localhost:8080/ > /dev/null
 
-      - name: Run API tests against Docker Hub deployment
+            for i in $(seq 1 60); do
+              STATUS=$(docker inspect \
+                --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                "$CONTAINER")
+
+              echo "$SERVICE status: $STATUS"
+
+              if [ "$STATUS" = "healthy" ]; then
+                return 0
+              fi
+
+              if [ "$STATUS" = "unhealthy" ] || [ "$STATUS" = "exited" ]; then
+                docker compose --env-file .env \
+                  -f docker-compose.deploy.yml logs "$SERVICE"
+                exit 1
+              fi
+
+              sleep 2
+            done
+
+            echo "$SERVICE health check timed out."
+            docker compose --env-file .env \
+              -f docker-compose.deploy.yml logs "$SERVICE"
+            exit 1
+          }
+
+          wait_for_health postgres
+          wait_for_health redis
+
+      # 10. Start backend
+      - name: Start backend
+        run: |
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml up -d backend
+
+      # 11. Wait for backend health
+      - name: Verify backend health
+        run: |
+          CONTAINER=$(docker compose --env-file .env \
+            -f docker-compose.deploy.yml ps -q backend)
+
+          for i in $(seq 1 60); do
+            STATUS=$(docker inspect \
+              --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+              "$CONTAINER")
+
+            echo "Backend status: $STATUS"
+
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Backend is healthy."
+              exit 0
+            fi
+
+            if [ "$STATUS" = "unhealthy" ] || [ "$STATUS" = "exited" ]; then
+              echo "Backend failed. Showing logs:"
+              docker compose --env-file .env \
+                -f docker-compose.deploy.yml logs --no-color backend
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Backend health check timed out."
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml logs --no-color backend
+          exit 1
+
+      # 12. Start frontend after backend is healthy
+      - name: Start frontend
+        run: |
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml up -d frontend
+
+      # 13. Verify complete deployment
+      - name: Verify deployment
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:3000/health; then
+              echo
+              echo "Backend API is responding."
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              docker compose --env-file .env \
+                -f docker-compose.deploy.yml ps -a
+              docker compose --env-file .env \
+                -f docker-compose.deploy.yml logs --no-color
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          curl --fail --silent http://localhost:8080/ > /dev/null
+          echo "Frontend is responding."
+
+      # 14. Run API tests
+      - name: Run API tests
         working-directory: tests
         env:
           BASE_URL: http://localhost:3000
@@ -119,16 +231,45 @@ jobs:
           npm install
           npm test
 
+      # 15. Save deployment summary
       - name: Record published image references
         run: |
           {
-            echo "## Docker Hub publication"
+            echo "## Docker Hub Publication"
             echo ""
-            echo "- Backend: `${{ secrets.DOCKERHUB_USERNAME }}/backend:latest`"
-            echo "- Frontend: `${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest`"
-            echo "- Commit: `${GITHUB_SHA}`"
+            echo "- Backend: ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest"
+            echo "- Frontend: ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Deployment: Successful"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 16. Always collect diagnostics if something fails
+      - name: Collect failure diagnostics
+        if: failure()
+        run: |
+          echo "=== Container Status ==="
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml ps -a || true
+
+          echo "=== Backend Logs ==="
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml logs --no-color backend || true
+
+          echo "=== PostgreSQL Logs ==="
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml logs --no-color postgres || true
+
+          echo "=== Redis Logs ==="
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml logs --no-color redis || true
+
+          echo "=== Frontend Logs ==="
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml logs --no-color frontend || true
+
+      # 17. Cleanup
       - name: Cleanup deployment
         if: always()
-        run: docker compose -f docker-compose.deploy.yml down -v --remove-orphans || true
+        run: |
+          docker compose --env-file .env \
+            -f docker-compose.deploy.yml down -v --remove-orphans || true
